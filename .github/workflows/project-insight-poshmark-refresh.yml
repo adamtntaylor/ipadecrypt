@@ -7,6 +7,7 @@ on:
   push:
     paths:
       - 'project-insight-public-api/scrape_poshmark.py'
+      - 'project-insight-public-api/normalize_catalog.py'
       - '.github/workflows/project-insight-poshmark-refresh.yml'
 
 permissions:
@@ -33,6 +34,9 @@ jobs:
         env:
           POSHMARK_MAX_LISTINGS: '48'
         run: python project-insight-public-api/scrape_poshmark.py
+
+      - name: Normalize catalog fidelity
+        run: python project-insight-public-api/normalize_catalog.py
 
       - name: Publish refreshed catalog
         run: |
