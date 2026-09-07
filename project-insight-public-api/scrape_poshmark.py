@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -33,11 +35,11 @@ CATEGORY_PAGES = [
     ("Accessories", "https://poshmark.com/category/Women-Accessories"),
 ]
 
-MAX_TOTAL = int(os.environ.get("POSHMARK_MAX_LISTINGS", "30"))
+MAX_TOTAL = int(os.environ.get("POSHMARK_MAX_LISTINGS", "48"))
 MAX_PER_CATEGORY = max(3, MAX_TOTAL // len(CATEGORY_PAGES))
 TIMEOUT = 20
 HEADERS = {
-    "User-Agent": "ProjectInsightPublicCatalog/1.0 (+https://github.com/adamtntaylor/ipadecrypt)",
+    "User-Agent": "ProjectInsightPublicCatalog/1.1 (+https://github.com/adamtntaylor/ipadecrypt)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
@@ -46,16 +48,22 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 
+def clean_text(value, limit: int | None = None) -> str:
+    text = html_unescape(str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] if limit else text
+
+
 def fetch(url: str, binary: bool = False):
     response = session.get(url, timeout=TIMEOUT, allow_redirects=True)
     if response.status_code in (403, 429):
-        raise RuntimeError(f"Poshmark declined the public refresh with HTTP {response.status_code}; not bypassing it.")
+        raise RuntimeError(f"Public refresh declined with HTTP {response.status_code}; not bypassing it.")
     response.raise_for_status()
     return response.content if binary else response.text
 
 
-def listing_links(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+def listing_links(page_html: str) -> list[str]:
+    soup = BeautifulSoup(page_html, "html.parser")
     links: list[str] = []
     seen = set()
     for a in soup.find_all("a", href=True):
@@ -68,8 +76,7 @@ def listing_links(html: str) -> list[str]:
             links.append(full)
     if links:
         return links
-    # Fallback for HTML where anchors are serialized inside app state.
-    for match in re.findall(r"(?:https://poshmark\.com)?(/listing/[A-Za-z0-9_%\-]+)", html):
+    for match in re.findall(r"(?:https://poshmark\.com)?(/listing/[A-Za-z0-9_%\-]+)", page_html):
         full = urljoin(BASE, match)
         if full not in seen:
             seen.add(full)
@@ -81,7 +88,7 @@ def meta(soup: BeautifulSoup, *keys: str) -> str:
     for key in keys:
         node = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
         if node and node.get("content"):
-            return node["content"].strip()
+            return clean_text(node["content"])
     return ""
 
 
@@ -127,9 +134,9 @@ def seller_from_data(product: dict, soup: BeautifulSoup) -> str:
         offers = offers[0] if offers else {}
     seller = offers.get("seller") if isinstance(offers, dict) else None
     if isinstance(seller, dict) and seller.get("name"):
-        return str(seller["name"]).lstrip("@").strip()
+        return clean_text(seller["name"]).lstrip("@").strip()
     if isinstance(seller, str):
-        return seller.lstrip("@").strip()
+        return clean_text(seller).lstrip("@").strip()
     body = soup.get_text(" ", strip=True)
     m = re.search(r"@([A-Za-z0-9_]{2,30})", body)
     return m.group(1) if m else "Poshmark seller"
@@ -138,31 +145,54 @@ def seller_from_data(product: dict, soup: BeautifulSoup) -> str:
 def brand_from_data(product: dict) -> str:
     brand = product.get("brand")
     if isinstance(brand, dict):
-        return str(brand.get("name") or "Unbranded")
+        return clean_text(brand.get("name") or "Unbranded")
     if isinstance(brand, str) and brand.strip():
-        return brand.strip()
+        return clean_text(brand)
     return "Unbranded"
 
 
-def condition_from_data(product: dict) -> str:
+def condition_from_data(product: dict, soup: BeautifulSoup) -> str:
     offers = product.get("offers") or {}
     item_condition = product.get("itemCondition") or (offers.get("itemCondition") if isinstance(offers, dict) else "")
-    text = str(item_condition).lower()
-    if "new" in text:
+    raw = str(item_condition).lower()
+    page_text = soup.get_text(" ", strip=True)
+    if "newcondition" in raw or re.search(r"\bNew With Tags\b|\bNew Without Tags\b", page_text, flags=re.I):
         return "New"
-    if "used" in text:
+    if re.search(r"\bLike New\b", page_text, flags=re.I):
+        return "Excellent"
+    if re.search(r"\bVery Good\b", page_text, flags=re.I):
+        return "Very Good"
+    if re.search(r"\bGood\b", page_text, flags=re.I):
+        return "Good"
+    if "used" in raw:
         return "Pre-Owned"
     return "Available"
 
 
-def size_from_text(soup: BeautifulSoup) -> str:
+def size_from_data(product: dict, soup: BeautifulSoup) -> str:
+    for key in ("size", "itemSize"):
+        value = product.get(key)
+        if isinstance(value, str) and value.strip():
+            cleaned = clean_text(value, 28)
+            if cleaned:
+                return cleaned
+
     text = soup.get_text(" ", strip=True)
-    m = re.search(r"\bSize\s*:?\s*([^|•\n]{1,28})", text, flags=re.I)
-    if m:
-        value = re.sub(r"\s+", " ", m.group(1)).strip(" :-")
-        if value:
-            return value[:28]
-    return "See listing"
+    m = re.search(r"\bSize\s*:?\s*([^|•\n]{1,80})", text, flags=re.I)
+    if not m:
+        return "See listing"
+
+    value = clean_text(m.group(1))
+    value = re.split(
+        r"\b(?:Buy Now|Make an Offer|Like and save|Pay in 4|Shipping/Discount|Add To Bundle|Seller Discount)\b",
+        value,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    value = value.strip(" :-•")
+    if not value:
+        return "See listing"
+    return value[:28]
 
 
 def listing_id(url: str) -> str:
@@ -183,14 +213,14 @@ def download_cover(remote_url: str, item_id: str) -> str | None:
         return None
     if len(data) < 500 or len(data) > 8_000_000:
         return None
-    content_type = ""
-    try:
-        r = session.get(remote_url, timeout=TIMEOUT, stream=True)
-        content_type = r.headers.get("content-type", "")
-        r.close()
-    except Exception:
-        pass
-    ext = ".png" if "png" in content_type.lower() or data.startswith(b"\x89PNG") else ".jpg"
+
+    if data.startswith(b"\x89PNG"):
+        ext = ".png"
+    elif data[:4] == b"RIFF" and b"WEBP" in data[:16]:
+        ext = ".webp"
+    else:
+        ext = ".jpg"
+
     IMG_DIR.mkdir(parents=True, exist_ok=True)
     path = IMG_DIR / f"{item_id}{ext}"
     path.write_bytes(data)
@@ -198,12 +228,12 @@ def download_cover(remote_url: str, item_id: str) -> str | None:
 
 
 def parse_listing(url: str, category: str) -> dict | None:
-    html = fetch(url)
-    soup = BeautifulSoup(html, "html.parser")
+    page_html = fetch(url)
+    soup = BeautifulSoup(page_html, "html.parser")
     product = product_json(soup)
 
-    title = str(product.get("name") or meta(soup, "og:title", "twitter:title")).strip()
-    description = str(product.get("description") or meta(soup, "og:description", "description")).strip()
+    title = clean_text(product.get("name") or meta(soup, "og:title", "twitter:title"), 180)
+    description = clean_text(product.get("description") or meta(soup, "og:description", "description"), 1800)
     image = product.get("image") or meta(soup, "og:image", "twitter:image")
     if isinstance(image, list):
         image = image[0] if image else ""
@@ -226,23 +256,23 @@ def parse_listing(url: str, category: str) -> dict | None:
     hosted_image = download_cover(str(image), item_id) if image else None
     original_price = price
     text = soup.get_text(" ", strip=True)
-    prices = [number(x) for x in re.findall(r"\$([\d,]+)", text)[:12]]
+    prices = [number(x) for x in re.findall(r"\$([\d,]+)", text)[:16]]
     larger = [p for p in prices if p > price and p < price * 20]
     if larger:
         original_price = min(larger)
 
     return {
         "id": item_id,
-        "title": re.sub(r"\s+", " ", title)[:180],
-        "brand": brand_from_data(product)[:80],
+        "title": title,
+        "brand": clean_text(brand_from_data(product), 80),
         "price": price,
         "originalPrice": original_price,
-        "size": size_from_text(soup),
-        "seller": seller_from_data(product, soup)[:40],
+        "size": size_from_data(product, soup),
+        "seller": clean_text(seller_from_data(product, soup), 40),
         "symbol": {"Bags": "bag", "Shoes": "shoe", "Clothing": "tshirt", "Watches": "watch.analog", "Tech": "laptopcomputer", "Accessories": "sparkles"}.get(category, "tag"),
         "category": category,
-        "condition": condition_from_data(product),
-        "detail": re.sub(r"\s+", " ", description or "Open the original Poshmark listing for complete seller-provided details.")[:1500],
+        "condition": condition_from_data(product, soup),
+        "detail": description or "Open the original Poshmark listing for complete seller-provided details.",
         "sellerRating": 0.0,
         "sellerLastActive": "See Poshmark",
         "shippingPrice": 0,
@@ -254,13 +284,27 @@ def parse_listing(url: str, category: str) -> dict | None:
     }
 
 
+def prune_stale_images(listings: list[dict]) -> None:
+    if not IMG_DIR.exists():
+        return
+    keep = set()
+    for item in listings:
+        image_url = item.get("imageURL") or ""
+        if image_url:
+            keep.add(Path(urlparse(image_url).path).name)
+    for path in IMG_DIR.iterdir():
+        if path.is_file() and path.name not in keep:
+            path.unlink()
+            print(f"removed stale cover {path.name}")
+
+
 def main() -> int:
     candidates: list[tuple[str, str]] = []
     seen = set()
     for category, page in CATEGORY_PAGES:
         print(f"discovering {category}: {page}")
-        html = fetch(page)
-        links = listing_links(html)
+        page_html = fetch(page)
+        links = listing_links(page_html)
         print(f"  found {len(links)} public listing links")
         for link in links[:MAX_PER_CATEGORY * 3]:
             if link not in seen:
@@ -268,7 +312,7 @@ def main() -> int:
                 candidates.append((category, link))
             if sum(1 for c, _ in candidates if c == category) >= MAX_PER_CATEGORY * 2:
                 break
-        time.sleep(0.4)
+        time.sleep(0.35)
 
     listings = []
     per_category: dict[str, int] = {}
@@ -288,20 +332,26 @@ def main() -> int:
             listings.append(item)
             per_category[category] = per_category.get(category, 0) + 1
             print(f"  + {item['title'][:70]} (${item['price']})")
-        time.sleep(0.35)
+        time.sleep(0.25)
 
-    if len(listings) < 6:
-        raise RuntimeError(f"Only parsed {len(listings)} listings; preserving the previous catalog instead of publishing a bad refresh.")
+    minimum_publishable = min(12, max(6, MAX_TOTAL // 4))
+    if len(listings) < minimum_publishable:
+        raise RuntimeError(
+            f"Only parsed {len(listings)} listings; preserving the previous catalog instead of publishing a bad refresh."
+        )
 
     payload = {
         "listings": listings,
         "nextCursor": None,
         "totalCount": len(listings),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "sourceName": "Poshmark public catalog",
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUT.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(OUT)
+    prune_stale_images(listings)
     print(f"published {len(listings)} public Poshmark listings to {OUT}")
     return 0
 
