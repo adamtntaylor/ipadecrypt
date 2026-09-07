@@ -3,7 +3,7 @@ name: Refresh Project Insight Poshmark Catalog
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '2,17,32,47 * * * *'
   push:
     paths:
       - 'project-insight-public-api/scrape_poshmark.py'
@@ -31,7 +31,7 @@ jobs:
 
       - name: Refresh from public Poshmark pages
         env:
-          POSHMARK_MAX_LISTINGS: '30'
+          POSHMARK_MAX_LISTINGS: '48'
         run: python project-insight-public-api/scrape_poshmark.py
 
       - name: Publish refreshed catalog
